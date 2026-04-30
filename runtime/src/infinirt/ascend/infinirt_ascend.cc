@@ -137,6 +137,26 @@ aclrtMemcpyKind toAclrtMemcpyKind(infinirtMemcpyKind_t kind) {
     }
 }
 
+infiniStatus_t toAclmdlRICaptureMode(infinirtStreamCaptureMode_t mode,
+                                     aclmdlRICaptureMode *acl_mode) {
+    if (acl_mode == nullptr) {
+        return INFINI_STATUS_NULL_POINTER;
+    }
+    switch (mode) {
+    case INFINIRT_STREAM_CAPTURE_MODE_GLOBAL:
+        *acl_mode = ACL_MODEL_RI_CAPTURE_MODE_GLOBAL;
+        return INFINI_STATUS_SUCCESS;
+    case INFINIRT_STREAM_CAPTURE_MODE_THREAD_LOCAL:
+        *acl_mode = ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL;
+        return INFINI_STATUS_SUCCESS;
+    case INFINIRT_STREAM_CAPTURE_MODE_RELAXED:
+        *acl_mode = ACL_MODEL_RI_CAPTURE_MODE_RELAXED;
+        return INFINI_STATUS_SUCCESS;
+    default:
+        return INFINI_STATUS_BAD_PARAM;
+    }
+}
+
 infiniStatus_t memcpy(void *dst, const void *src, size_t size, infinirtMemcpyKind_t kind) {
     CHECK_ACLRT(aclrtMemcpy(dst, size, src, size, toAclrtMemcpyKind(kind)));
     return INFINI_STATUS_SUCCESS;
@@ -156,15 +176,30 @@ infiniStatus_t freeAsync(void *ptr, infinirtStream_t stream) {
 }
 
 infiniStatus_t streamBeginCapture(infinirtStream_t stream, infinirtStreamCaptureMode_t mode) {
-    return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
+    aclmdlRICaptureMode acl_mode;
+    auto status = toAclmdlRICaptureMode(mode, &acl_mode);
+    if (status != INFINI_STATUS_SUCCESS) {
+        return status;
+    }
+    CHECK_ACLRT(aclmdlRICaptureBegin((aclrtStream)stream, acl_mode));
+    return INFINI_STATUS_SUCCESS;
 }
 
 infiniStatus_t streamEndCapture(infinirtStream_t stream, infinirtGraph_t *graph_ptr) {
-    return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
+    if (graph_ptr == nullptr) {
+        return INFINI_STATUS_NULL_POINTER;
+    }
+    aclmdlRI model_ri = nullptr;
+    CHECK_ACLRT(aclmdlRICaptureEnd((aclrtStream)stream, &model_ri));
+    *graph_ptr = (infinirtGraph_t)model_ri;
+    return INFINI_STATUS_SUCCESS;
 }
 
 infiniStatus_t graphDestroy(infinirtGraph_t graph) {
-    return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
+    // Ascend capture returns an aclmdlRI directly. graphInstantiate aliases the
+    // graph exec to the same handle, so graphExecDestroy owns the release.
+    (void)graph;
+    return INFINI_STATUS_SUCCESS;
 }
 
 infiniStatus_t graphInstantiate(
@@ -173,15 +208,35 @@ infiniStatus_t graphInstantiate(
     infinirtGraphNode_t *node_ptr,
     char *log_buffer,
     size_t buffer_size) {
-    return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
+    if (graph_exec_ptr == nullptr) {
+        return INFINI_STATUS_NULL_POINTER;
+    }
+    if (graph == nullptr) {
+        return INFINI_STATUS_BAD_PARAM;
+    }
+    *graph_exec_ptr = graph;
+    if (node_ptr != nullptr) {
+        *node_ptr = nullptr;
+    }
+    (void)log_buffer;
+    (void)buffer_size;
+    return INFINI_STATUS_SUCCESS;
 }
 
 infiniStatus_t graphExecDestroy(infinirtGraphExec_t graph_exec) {
-    return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
+    if (graph_exec == nullptr) {
+        return INFINI_STATUS_SUCCESS;
+    }
+    CHECK_ACLRT(aclmdlRIDestroy((aclmdlRI)graph_exec));
+    return INFINI_STATUS_SUCCESS;
 }
 
 infiniStatus_t graphLuanch(infinirtGraphExec_t graph_exec, infinirtStream_t stream) {
-    return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
+    if (graph_exec == nullptr) {
+        return INFINI_STATUS_BAD_PARAM;
+    }
+    CHECK_ACLRT(aclmdlRIExecuteAsync((aclmdlRI)graph_exec, (aclrtStream)stream));
+    return INFINI_STATUS_SUCCESS;
 }
 
 } // namespace infinirt::ascend
