@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../../backends/infiniops/infiniops.hpp"
 #include "../../config/model_config.hpp"
 #include "infinicore/device.hpp"
 #include "infinicore/nn/module.hpp"
@@ -9,6 +10,12 @@
 #include <memory>
 #include <tuple>
 namespace infinilm::layers::causal_lm_templates {
+
+#ifdef INFINILM_ENABLE_INFINIOPS
+using DecoderRMSNorm = infinilm::backends::infiniops::RMSNorm;
+#else
+using DecoderRMSNorm = infinicore::nn::RMSNorm;
+#endif
 
 /**
  * @brief Generic Text decoder layer (transformer block) class.
@@ -28,8 +35,8 @@ public:
         size_t hidden_size = model_config->get<size_t>("hidden_size");
         double rms_norm_eps = model_config->get<double>("rms_norm_eps");
 
-        input_layernorm_ = this->register_module<infinicore::nn::RMSNorm>("input_layernorm", hidden_size, rms_norm_eps, dtype, device);
-        post_attention_layernorm_ = this->register_module<infinicore::nn::RMSNorm>("post_attention_layernorm", hidden_size, rms_norm_eps, dtype, device);
+        input_layernorm_ = this->register_module<DecoderRMSNorm>("input_layernorm", hidden_size, rms_norm_eps, dtype, device);
+        post_attention_layernorm_ = this->register_module<DecoderRMSNorm>("post_attention_layernorm", hidden_size, rms_norm_eps, dtype, device);
 
         self_attn_ = this->register_module<Attention>("self_attn", model_config, layer_idx, device);
         mlp_ = this->register_module<MLP>("mlp", model_config, device);
@@ -62,8 +69,8 @@ public:
     size_t layer_idx() const { return layer_idx_; }
 
 protected:
-    INFINICORE_NN_MODULE(infinicore::nn::RMSNorm, input_layernorm);
-    INFINICORE_NN_MODULE(infinicore::nn::RMSNorm, post_attention_layernorm);
+    INFINICORE_NN_MODULE(DecoderRMSNorm, input_layernorm);
+    INFINICORE_NN_MODULE(DecoderRMSNorm, post_attention_layernorm);
     INFINICORE_NN_MODULE(Attention, self_attn);
     INFINICORE_NN_MODULE(MLP, mlp);
 

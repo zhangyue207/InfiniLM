@@ -1,5 +1,6 @@
 #include "rank_worker.hpp"
 
+#include "../backends/infiniops/infiniops.hpp"
 #include "../global_state/global_state.hpp"
 #include "../models/model_factory.hpp"
 #include "../models/models_registry.hpp"
@@ -263,6 +264,10 @@ void RankWorker::thread_loop() {
             } else {
                 std::vector<std::string> classic_models = {"llama", "qwen2", "minicpm", "fm9g", "fm9g7b"};
                 if ((std::find(classic_models.begin(), classic_models.end(), model_type) != classic_models.end())) {
+                    if (rank_info_.device.getType() == infinicore::Device::Type::ASCEND) {
+                        throw std::runtime_error(
+                            "RankWorker::thread_loop(): Ascend does not support the classic model path for model_type: " + model_type);
+                    }
                     model_ = InfinilmModelFactory::createModel(
                         model_config_,
                         rank_info_,
@@ -382,22 +387,27 @@ void RankWorker::thread_loop() {
                             const auto &total_len{logits_shape[1]};
                             const auto &batch_size{logits_shape[0]};
 
-                            auto n_req = local_args.input_offsets.value()->size(0) - 1;
-                            int32_t *input_offsets = (int32_t *)local_args.input_offsets.value()->data();
+                            infinicore::Tensor output_ids;
+                            if (backends::infiniops::should_use(rank_info_.device)) {
+                                output_ids = backends::infiniops::sample_from_logits(
+                                    logits, local_args.input_offsets.value(),
+                                    temperature, top_k, top_p);
+                            } else {
+                                auto n_req = local_args.input_offsets.value()->size(0) - 1;
+                                int32_t *input_offsets = (int32_t *)local_args.input_offsets.value()->data();
+                                output_ids = infinicore::Tensor::empty({n_req}, infinicore::DataType::I64, rank_info_.device);
 
-                            auto output_ids{infinicore::Tensor::empty({n_req}, infinicore::DataType::I64, rank_info_.device)};
+                                for (auto i{decltype(n_req)(0)}; i < n_req; ++i) {
+                                    auto score{logits->view({batch_size * total_len, vocab_size})->narrow({{0, size_t(input_offsets[i + 1] - 1), 1}})->view({vocab_size})};
+                                    auto out{output_ids->narrow({{0, i, 1}})->view({})};
+                                    float random_val = std::uniform_real_distribution<float>(0, 1)(rng_);
+                                    infinicore::op::random_sample_(
+                                        out, score, random_val, top_p, top_k, temperature);
+                                }
 
-                            for (auto i{decltype(n_req)(0)}; i < n_req; ++i) {
-                                auto score{logits->view({batch_size * total_len, vocab_size})->narrow({{0, size_t(input_offsets[i + 1] - 1), 1}})->view({vocab_size})};
-                                auto out{output_ids->narrow({{0, i, 1}})->view({})};
-                                float random_val = std::uniform_real_distribution<float>(0, 1)(rng_);
-                                infinicore::op::random_sample_(
-                                    out, score, random_val, top_p, top_k, temperature);
+                                output_ids = output_ids->to(infinicore::Device::cpu());
+                                infinicore::context::syncStream();
                             }
-
-                            output_ids = output_ids->to(infinicore::Device::cpu());
-
-                            infinicore::context::syncStream();
 
                             auto out{Output{output_ids}};
 

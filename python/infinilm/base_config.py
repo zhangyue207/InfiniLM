@@ -112,7 +112,22 @@ class BaseConfig:
             # `op::paged_attention_` for some shapes, and (more importantly)
             # avoids maintaining two parallel paged paths. Other platforms
             # keep the handwritten kernel.
-            self.attn = "flash-attn" if self.device == "hygon" else "paged-attn"
+            self.attn = (
+                "flash-attn"
+                if self.device in ("hygon", "ascend", "npu")
+                else "paged-attn"
+            )
+
+        if self.device in ("ascend", "npu"):
+            if self.cache_type != "paged" or not self.enable_paged_attn:
+                raise ValueError(
+                    "--device=ascend currently requires --enable-paged-attn "
+                    "with paged cache."
+                )
+            if self.attn != "flash-attn":
+                raise ValueError(
+                    "--device=ascend currently requires --attn=flash-attn."
+                )
 
         # DTK fork's `paged_attention` symbol on gfx936 silently half-writes
         # output for any block_size != 64. No TORCH_CHECK fires; user just

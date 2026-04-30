@@ -7,6 +7,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(INFINIRT_ENABLE_CPU    "Enable CPU backend"    ON)
 option(INFINIRT_ENABLE_NVIDIA "Enable NVIDIA backend" ON)
+option(INFINIRT_ENABLE_ASCEND "Enable Ascend backend" OFF)
 option(INFINIRT_ENABLE_OMP    "Enable OpenMP"         ON)
 # CUDA-API-compatible backends share the cuda/*.cu sources but pick a different
 # infinirt::<ns> namespace via ENABLE_<X>_API. Set INFINI_NV_BACKEND to one of
@@ -24,6 +25,7 @@ set(INFINIRT_BACKEND_SRC "")
 set(INFINIRT_BACKEND_CU_SRC "")
 set(INFINIRT_DEFS "")
 set(INFINIRT_LINK_LIBS "")
+set(INFINIRT_PRIVATE_INCLUDES "")
 
 if(INFINIRT_ENABLE_CPU)
     file(GLOB _cpu_src CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/infinirt/cpu/*.cc")
@@ -42,6 +44,21 @@ if(INFINIRT_ENABLE_NVIDIA)
     list(APPEND INFINIRT_LINK_LIBS CUDA::cudart)
 endif()
 
+if(INFINIRT_ENABLE_ASCEND)
+    if(NOT DEFINED ASCEND_HOME)
+        if(DEFINED ENV{ASCEND_HOME_PATH} AND NOT "$ENV{ASCEND_HOME_PATH}" STREQUAL "")
+            set(ASCEND_HOME "$ENV{ASCEND_HOME_PATH}" CACHE PATH "Ascend toolkit root")
+        else()
+            set(ASCEND_HOME "/usr/local/Ascend/ascend-toolkit/latest" CACHE PATH "Ascend toolkit root")
+        endif()
+    endif()
+    file(GLOB _ascend_src CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/infinirt/ascend/*.cc")
+    list(APPEND INFINIRT_BACKEND_SRC ${_ascend_src})
+    list(APPEND INFINIRT_DEFS ENABLE_ASCEND_API)
+    list(APPEND INFINIRT_PRIVATE_INCLUDES "${ASCEND_HOME}/include")
+    list(APPEND INFINIRT_LINK_LIBS "${ASCEND_HOME}/lib64/libascendcl.so")
+endif()
+
 add_library(infinirt SHARED
     ${UTILS_SRC}
     ${INFINIRT_CORE_SRC}
@@ -54,6 +71,7 @@ target_include_directories(infinirt
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
             "${SPDLOG_INCLUDE}"
             "${JSON_INCLUDE}"
+            ${INFINIRT_PRIVATE_INCLUDES}
 )
 
 target_compile_definitions(infinirt PRIVATE ${INFINIRT_DEFS})

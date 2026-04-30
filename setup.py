@@ -7,6 +7,21 @@ Environment knobs (read at install/build time):
       (e.g. `source /opt/dtk/env.sh`) so hipcc, hipblas, and rccl are findable.
       Defaults to OFF (NVIDIA build).
 
+  INFINILM_ENABLE_ASCEND=1
+      Build the modern CMake path for Ascend CANN/HCCL and use the sibling
+      InfiniOps checkout as the Ascend operator backend.
+
+  INFINILM_ENABLE_INFINIOPS=1
+      Enable the sibling InfiniOps Ascend operator adapter. This must be set
+      explicitly together with INFINILM_ENABLE_ASCEND=1.
+
+  INFINIOPS_ROOT=/abs/path
+      Sibling InfiniOps source checkout. Default: ../InfiniOps.
+
+  INFINIOPS_LIBRARY=/abs/path/libinfiniops.so
+      Installed InfiniOps shared library. Auto-detected from the Python
+      `infini` package when empty.
+
   INFINILM_BUILD_FLASH_ATTN=1
       Enable the FlashAttention backend. When set, flash-attention source is
       auto-cloned to third_party/flash-attention if missing, and the resulting
@@ -143,6 +158,23 @@ def build_cpp_module():
     BUILD_DIR.mkdir(exist_ok=True)
 
     enable_hygon = _env_bool("INFINILM_ENABLE_HYGON")
+    enable_ascend = _env_bool("INFINILM_ENABLE_ASCEND")
+    enable_infiniops = _env_bool("INFINILM_ENABLE_INFINIOPS")
+    if enable_hygon and enable_ascend:
+        raise RuntimeError(
+            "INFINILM_ENABLE_HYGON=1 and INFINILM_ENABLE_ASCEND=1 are mutually exclusive."
+        )
+    if enable_ascend and not enable_infiniops:
+        raise RuntimeError(
+            "INFINILM_ENABLE_ASCEND=1 requires INFINILM_ENABLE_INFINIOPS=1. "
+            "Specify both options explicitly."
+        )
+    if enable_infiniops and not enable_ascend:
+        raise RuntimeError(
+            "INFINILM_ENABLE_INFINIOPS=1 currently supports only Ascend. "
+            "Set INFINILM_ENABLE_ASCEND=1 as well."
+        )
+
     if enable_hygon:
         _source_dtk_env()
     elif os.path.isdir("/opt/dtk"):
@@ -157,7 +189,14 @@ def build_cpp_module():
         "-B", str(BUILD_DIR),
         f"-DCMAKE_BUILD_TYPE={os.environ.get('INFINILM_BUILD_TYPE', 'Release')}",
         f"-DINFINILM_ENABLE_HYGON={'ON' if enable_hygon else 'OFF'}",
+        f"-DINFINILM_ENABLE_ASCEND={'ON' if enable_ascend else 'OFF'}",
+        f"-DINFINILM_ENABLE_INFINIOPS={'ON' if enable_infiniops else 'OFF'}",
     ]
+
+    if os.environ.get("INFINIOPS_ROOT"):
+        cmake_args.append(f"-DINFINIOPS_ROOT={os.environ['INFINIOPS_ROOT']}")
+    if os.environ.get("INFINIOPS_LIBRARY"):
+        cmake_args.append(f"-DINFINIOPS_LIBRARY={os.environ['INFINIOPS_LIBRARY']}")
 
     fa_dir = _ensure_flash_attn_dir()
     if enable_hygon and _env_bool("INFINILM_BUILD_FLASH_ATTN") and not fa_dir:

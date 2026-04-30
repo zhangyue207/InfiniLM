@@ -143,13 +143,20 @@ class LLMEngine:
 
     def _init_device(self):
         """Initialize infinicore device and dtype."""
-        supported_devices = ["cpu", "cuda", "mlu", "musa"]
+        supported_devices = ["cpu", "cuda", "mlu", "musa", "npu", "ascend"]
         device_str = self.config.device
         if device_str not in supported_devices:
             raise ValueError(
                 f"Unsupported device: '{device_str}'. "
                 f"Supported devices: {supported_devices}"
             )
+        if device_str in ("npu", "ascend"):
+            if self.config.cache_type != "paged":
+                raise ValueError("Ascend currently requires paged KV cache.")
+            if self.config.attn_backend == "default":
+                self.config.attn_backend = "flash-attn"
+            elif self.config.attn_backend != "flash-attn":
+                raise ValueError("Ascend currently requires attn_backend='flash-attn'.")
         self.device = infinicore.device(device_str, 0)
 
         dtype_map = {

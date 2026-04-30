@@ -19,10 +19,57 @@ if(INFINILM_ENABLE_HYGON)
     set(INFINI_NV_BACKEND "HYGON" CACHE STRING "" FORCE)
 endif()
 
+option(INFINILM_ENABLE_ASCEND "Build InfiniLM runtime/ccl/core for Ascend CANN/HCCL" OFF)
+if(INFINILM_ENABLE_HYGON AND INFINILM_ENABLE_ASCEND)
+    message(FATAL_ERROR "INFINILM_ENABLE_HYGON=ON and INFINILM_ENABLE_ASCEND=ON are mutually exclusive. Select exactly one target platform.")
+endif()
+if(INFINILM_ENABLE_ASCEND)
+    set(INFINIRT_ENABLE_NVIDIA OFF CACHE BOOL "" FORCE)
+    set(INFINIRT_ENABLE_ASCEND ON CACHE BOOL "" FORCE)
+    set(INFINIOPS_ENABLE_NVIDIA OFF CACHE BOOL "" FORCE)
+    # Do not route Ascend inference through the legacy vendored InfiniLM/ops
+    # backend. Ascend operator coverage is provided by the sibling InfiniOps
+    # adapter under csrc/backends/infiniops.
+    set(INFINIOPS_ENABLE_ASCEND OFF CACHE BOOL "" FORCE)
+    set(INFINICCL_ENABLE_NVIDIA OFF CACHE BOOL "" FORCE)
+    set(INFINICCL_ENABLE_ASCEND ON CACHE BOOL "" FORCE)
+
+    if(NOT DEFINED ASCEND_HOME)
+        if(DEFINED ENV{ASCEND_HOME_PATH} AND NOT "$ENV{ASCEND_HOME_PATH}" STREQUAL "")
+            set(ASCEND_HOME "$ENV{ASCEND_HOME_PATH}" CACHE PATH "Ascend toolkit root")
+        else()
+            set(ASCEND_HOME "/usr/local/Ascend/ascend-toolkit/latest" CACHE PATH "Ascend toolkit root")
+        endif()
+    endif()
+    if(NOT EXISTS "${ASCEND_HOME}")
+        message(FATAL_ERROR "INFINILM_ENABLE_ASCEND=ON but ASCEND_HOME was not found. Set ASCEND_HOME_PATH.")
+    endif()
+    message(STATUS "Using Ascend from `${ASCEND_HOME}`.")
+endif()
+
+option(INFINILM_ENABLE_INFINIOPS "Use sibling InfiniOps as the Ascend operator adapter" OFF)
+if(INFINILM_ENABLE_ASCEND AND NOT INFINILM_ENABLE_INFINIOPS)
+    message(FATAL_ERROR "INFINILM_ENABLE_ASCEND=ON requires INFINILM_ENABLE_INFINIOPS=ON. Specify both options explicitly.")
+endif()
+if(INFINILM_ENABLE_INFINIOPS AND NOT INFINILM_ENABLE_ASCEND)
+    message(FATAL_ERROR "INFINILM_ENABLE_INFINIOPS currently supports only the Ascend adapter. Set INFINILM_ENABLE_ASCEND=ON.")
+endif()
+set(INFINIOPS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../InfiniOps" CACHE PATH "Path to sibling InfiniOps source tree")
+set(INFINIOPS_LIBRARY "" CACHE FILEPATH "Path to libinfiniops.so; auto-detected from Python package when empty")
+
 # Subprojects - each builds as standalone too.
 add_subdirectory(runtime)     # libinfinirt.so
 add_subdirectory(ccl)         # libinfiniccl.so
 add_subdirectory(ops)         # libinfinicore.so + _infinicore python module
+
+if(INFINILM_ENABLE_ASCEND)
+    target_sources(infinicore PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/ops/src/infiniop/devices/ascend/ascend_handle.cc")
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/ops/src/infiniop/devices/handle.cc"
+        TARGET_DIRECTORY infinicore
+        PROPERTIES COMPILE_DEFINITIONS ENABLE_ASCEND_API)
+endif()
 
 # ---- _infinilm pybind module ----
 option(INFINILM_BUILD_PYBIND "Build _infinilm python module" ON)
@@ -62,7 +109,11 @@ if(INFINILM_BUILD_PYBIND)
     )
     # Mirror the API-selector define from runtime/ccl/ops onto the pybind module
     # so any csrc/ TU that switches on ENABLE_<X>_API picks the same backend.
-    target_compile_definitions(_infinilm PRIVATE "ENABLE_${INFINI_NV_BACKEND}_API")
+    if(INFINILM_ENABLE_ASCEND)
+        target_compile_definitions(_infinilm PRIVATE ENABLE_ASCEND_API)
+    else()
+        target_compile_definitions(_infinilm PRIVATE "ENABLE_${INFINI_NV_BACKEND}_API")
+    endif()
 
     option(INFINILM_ENABLE_KV_CACHING "Enable KV caching op" OFF)
     if(INFINILM_ENABLE_KV_CACHING)
@@ -74,13 +125,72 @@ if(INFINILM_BUILD_PYBIND)
         target_compile_definitions(_infinilm PRIVATE USE_CLASSIC_LLAMA)
     endif()
 
+    set(_infinilmlink_rpath "$ORIGIN")
+    if(INFINILM_ENABLE_INFINIOPS)
+        if(NOT EXISTS "${INFINIOPS_ROOT}/src/operator.h")
+            message(FATAL_ERROR "INFINILM_ENABLE_INFINIOPS=ON but ${INFINIOPS_ROOT}/src/operator.h was not found.")
+        endif()
+
+        if(NOT INFINIOPS_LIBRARY)
+            execute_process(
+                COMMAND ${Python3_EXECUTABLE} -c "import pathlib, infini; p=pathlib.Path(infini.__file__).resolve().parent/'libinfiniops.so'; print(p if p.exists() else '')"
+                OUTPUT_VARIABLE _infinilmlink_infiniops_lib
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET
+            )
+            if(_infinilmlink_infiniops_lib)
+                set(INFINIOPS_LIBRARY "${_infinilmlink_infiniops_lib}" CACHE FILEPATH "Path to libinfiniops.so" FORCE)
+            endif()
+        endif()
+        if(NOT INFINIOPS_LIBRARY OR NOT EXISTS "${INFINIOPS_LIBRARY}")
+            message(FATAL_ERROR "INFINILM_ENABLE_INFINIOPS=ON but libinfiniops.so was not found. Install InfiniOps first or set INFINIOPS_LIBRARY.")
+        endif()
+
+        target_compile_definitions(_infinilm PRIVATE INFINILM_ENABLE_INFINIOPS)
+        target_include_directories(_infinilm PRIVATE "${INFINIOPS_ROOT}/src")
+        target_link_libraries(_infinilm PRIVATE "${INFINIOPS_LIBRARY}")
+
+        get_filename_component(_infinilmlink_infiniops_lib_dir "${INFINIOPS_LIBRARY}" DIRECTORY)
+        string(APPEND _infinilmlink_rpath ";${_infinilmlink_infiniops_lib_dir}")
+        if(INFINILM_ENABLE_ASCEND)
+            target_include_directories(_infinilm PRIVATE
+                "${ASCEND_HOME}/include"
+                "${ASCEND_HOME}/include/aclnn"
+                "${ASCEND_HOME}/include/aclnnop"
+                "${ASCEND_HOME}/include/hccl")
+            target_link_libraries(_infinilm PRIVATE
+                "${ASCEND_HOME}/lib64/libascendcl.so"
+                "${ASCEND_HOME}/lib64/libnnopbase.so"
+                "${ASCEND_HOME}/lib64/libopapi.so"
+                "${ASCEND_HOME}/lib64/libhccl.so")
+            string(APPEND _infinilmlink_rpath ";${ASCEND_HOME}/lib64")
+
+            set(ATB_HOME_DIR "$ENV{ATB_HOME_PATH}")
+            if(NOT ATB_HOME_DIR)
+                file(GLOB ATB_SEARCH_DIRS "/usr/local/Ascend/nnal/atb/*/atb/cxx_abi_1")
+                if(ATB_SEARCH_DIRS)
+                    list(SORT ATB_SEARCH_DIRS ORDER DESCENDING)
+                    list(GET ATB_SEARCH_DIRS 0 ATB_HOME_DIR)
+                endif()
+            endif()
+            if(ATB_HOME_DIR AND EXISTS "${ATB_HOME_DIR}/include/atb/operation.h")
+                target_compile_definitions(_infinilm PRIVATE INFINI_HAS_ATB)
+                target_include_directories(_infinilm PRIVATE "${ATB_HOME_DIR}/include")
+                target_link_libraries(_infinilm PRIVATE "${ATB_HOME_DIR}/lib/libatb.so")
+                string(APPEND _infinilmlink_rpath ";${ATB_HOME_DIR}/lib")
+            else()
+                message(FATAL_ERROR "INFINILM_ENABLE_ASCEND=ON requires ATB for TopKTopPSampler. Set ATB_HOME_PATH.")
+            endif()
+        endif()
+    endif()
+
     set(INFINILM_PY_PKG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/python/infinilm" CACHE PATH "infinilm python package dir")
     install(TARGETS _infinilm LIBRARY DESTINATION "${INFINILM_PY_PKG_DIR}/lib")
 
     set_target_properties(_infinilm PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY "${INFINILM_PY_PKG_DIR}/lib"
         BUILD_WITH_INSTALL_RPATH TRUE
-        INSTALL_RPATH "$ORIGIN"
+        INSTALL_RPATH "${_infinilmlink_rpath}"
     )
 
     # Co-locate the three core shared libs next to _infinilm.so so RPATH=$ORIGIN works

@@ -1,5 +1,6 @@
 #include "flash_attn.hpp"
 
+#include "../../../backends/infiniops/infiniops.hpp"
 #include "../../../utils.hpp"
 #include "infinicore/ops.hpp"
 #include "infinicore/ops/mha_kvcache.hpp"
@@ -53,6 +54,21 @@ infinicore::Tensor FlashAttentionImpl::forward(const AttentionLayer &layer,
     // is `[num_blocks, block_size, num_kv_heads, head_dim]` (BSHD), which is
     // exactly what flash-attn's mha_varlen_fwd / mha_fwd_kvcache expect.
     if (is_prefill) {
+#ifdef INFINILM_ENABLE_INFINIOPS
+        if (infinilm::backends::infiniops::should_use(query->device())) {
+            infinilm::backends::infiniops::mha_varlen_fwd(
+                attn_output,
+                query,
+                k_total,
+                v_total,
+                input_offsets.value(),
+                cu_seqlens.value(),
+                block_tables.value(),
+                max_position_embeddings_,
+                max_position_embeddings_,
+                scale_);
+        } else
+#endif
         infinicore::op::mha_varlen_(
             attn_output,
             query,
@@ -70,6 +86,20 @@ infinicore::Tensor FlashAttentionImpl::forward(const AttentionLayer &layer,
         // In paged-attn mode, seq_len = actual batch_size (one query token per sequence).
         // q_reshaped: [seq_len, num_heads, head_dim] → [seq_len, 1, num_heads, head_dim]
         auto q_for_fa = query->view({seq_len, 1, num_heads_, head_dim_});
+#ifdef INFINILM_ENABLE_INFINIOPS
+        if (infinilm::backends::infiniops::should_use(query->device())) {
+            auto attn_out_4d = infinicore::Tensor::empty(q_for_fa->shape(), q_for_fa->dtype(), q_for_fa->device());
+            infinilm::backends::infiniops::mha_fwd_kvcache(
+                attn_out_4d,
+                q_for_fa,
+                k_total,
+                v_total,
+                total_sequence_lengths.value(),
+                block_tables.value(),
+                scale_);
+            attn_output = attn_out_4d->view({seq_len, num_heads_, head_dim_});
+        } else {
+#endif
         auto attn_out_4d = infinicore::op::mha_kvcache(
             q_for_fa,
             k_total, // [num_blocks, block_size, num_kv_heads, head_dim]
@@ -79,6 +109,9 @@ infinicore::Tensor FlashAttentionImpl::forward(const AttentionLayer &layer,
             std::nullopt,
             scale_);
         attn_output = attn_out_4d->view({seq_len, num_heads_, head_dim_});
+#ifdef INFINILM_ENABLE_INFINIOPS
+        }
+#endif
     }
     attn_output = attn_output->view({1, seq_len, num_heads_ * head_dim_});
     return attn_output;
@@ -91,6 +124,12 @@ std::tuple<infinicore::Tensor, infinicore::Tensor> FlashAttentionImpl::do_kv_cac
                                                                                           const infinicore::Tensor slot_mapping) const {
     auto k_cache_layer = kv_cache->narrow({{0, 0, 1}})->squeeze(0);
     auto v_cache_layer = kv_cache->narrow({{0, 1, 1}})->squeeze(0);
+#ifdef INFINILM_ENABLE_INFINIOPS
+    if (infinilm::backends::infiniops::should_use(key->device())) {
+        infinilm::backends::infiniops::reshape_and_cache(key, value, kv_cache, slot_mapping);
+        return {k_cache_layer, v_cache_layer};
+    }
+#endif
     infinicore::op::paged_caching_(
         k_cache_layer->permute({0, 2, 1, 3}), // permute to BHSD for paged_caching_
         v_cache_layer->permute({0, 2, 1, 3}),

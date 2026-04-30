@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(INFINICCL_ENABLE_NVIDIA "Enable NVIDIA (NCCL) backend" ON)
+option(INFINICCL_ENABLE_ASCEND "Enable Ascend (HCCL) backend" OFF)
 
 # Let caller point to the companion runtime subdirectory, or use an existing target.
 set(INFINILM_RUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../runtime" CACHE PATH "Path to runtime subproject")
@@ -18,8 +19,10 @@ endif()
 file(GLOB INFINICCL_CORE_SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/infiniccl/*.cc")
 
 set(INFINICCL_CU_SRC "")
+set(INFINICCL_BACKEND_SRC "")
 set(INFINICCL_DEFS "")
 set(INFINICCL_LINK_LIBS "")
+set(INFINICCL_PRIVATE_INCLUDES "")
 
 set(INFINI_NV_BACKEND "NVIDIA" CACHE STRING "Which CUDA-compatible backend the cuda/ sources implement")
 
@@ -70,11 +73,31 @@ if(INFINICCL_ENABLE_NVIDIA)
     endif()
 endif()
 
-add_library(infiniccl SHARED ${INFINICCL_CORE_SRC} ${INFINICCL_CU_SRC})
+if(INFINICCL_ENABLE_ASCEND)
+    if(NOT DEFINED ASCEND_HOME)
+        if(DEFINED ENV{ASCEND_HOME_PATH} AND NOT "$ENV{ASCEND_HOME_PATH}" STREQUAL "")
+            set(ASCEND_HOME "$ENV{ASCEND_HOME_PATH}" CACHE PATH "Ascend toolkit root")
+        else()
+            set(ASCEND_HOME "/usr/local/Ascend/ascend-toolkit/latest" CACHE PATH "Ascend toolkit root")
+        endif()
+    endif()
+    file(GLOB _ascend_src CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/infiniccl/ascend/*.cc")
+    list(APPEND INFINICCL_BACKEND_SRC ${_ascend_src})
+    list(APPEND INFINICCL_DEFS ENABLE_ASCEND_API ENABLE_CCL)
+    list(APPEND INFINICCL_PRIVATE_INCLUDES
+        "${ASCEND_HOME}/include"
+        "${ASCEND_HOME}/include/hccl")
+    list(APPEND INFINICCL_LINK_LIBS
+        "${ASCEND_HOME}/lib64/libascendcl.so"
+        "${ASCEND_HOME}/lib64/libhccl.so")
+endif()
+
+add_library(infiniccl SHARED ${INFINICCL_CORE_SRC} ${INFINICCL_CU_SRC} ${INFINICCL_BACKEND_SRC})
 
 target_include_directories(infiniccl
     PUBLIC  "${CMAKE_CURRENT_SOURCE_DIR}/include"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            ${INFINICCL_PRIVATE_INCLUDES}
 )
 if(NCCL_INCLUDE)
     target_include_directories(infiniccl PRIVATE "${NCCL_INCLUDE}")

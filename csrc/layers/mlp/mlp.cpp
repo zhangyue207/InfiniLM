@@ -1,4 +1,5 @@
 #include "mlp.hpp"
+#include "../../backends/infiniops/infiniops.hpp"
 #include "../../global_state/global_state.hpp"
 #include "infinicore/ops.hpp"
 
@@ -52,7 +53,13 @@ infinicore::Tensor MLP::forward(const infinicore::Tensor &hidden_states) const {
     auto hidden_states_mutable = hidden_states;
     auto [gate, up] = gate_up_proj_->forward_split(hidden_states_mutable);
     // 2. Apply SwiGLU: silu(gate) * up
-    auto intermediate = infinicore::op::swiglu(up, gate);
+    auto intermediate =
+#ifdef INFINILM_ENABLE_INFINIOPS
+        infinilm::backends::infiniops::should_use(up->device())
+            ? infinilm::backends::infiniops::swiglu(up, gate)
+            :
+#endif
+            infinicore::op::swiglu(up, gate);
     // 3. Project down
     auto output = down_proj_->forward(intermediate);
     return output;

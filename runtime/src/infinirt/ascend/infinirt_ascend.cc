@@ -19,6 +19,10 @@ infiniStatus_t init() {
 }
 
 infiniStatus_t getDeviceCount(int *count) {
+    auto status = init();
+    if (status != INFINI_STATUS_SUCCESS) {
+        return status;
+    }
     uint32_t count_ = 0;
     CHECK_ACLRT(aclrtGetDeviceCount(&count_));
     *count = (int)count_;

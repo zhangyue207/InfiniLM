@@ -125,6 +125,11 @@ def _initialize_device_relationship(all_device_types, all_device_count):
             else:
                 python_2_infinicore_dict[python_device_type] = [infinicore_instance]
 
+            if infinicore_device_type == _infinicore.Device.Type.ASCEND:
+                python_2_infinicore_dict.setdefault("ascend", []).append(
+                    infinicore_instance
+                )
+
     return infinicore_2_python_dict, python_2_infinicore_dict
 
 
