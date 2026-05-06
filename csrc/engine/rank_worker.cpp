@@ -281,7 +281,14 @@ void RankWorker::thread_loop() {
             if (!model_) {
                 throw std::runtime_error("Failed to create model");
             }
-            if (enable_graph_compiling_) {
+            if (enable_graph_compiling_ && rank_info_.device.getType() == infinicore::Device::Type::ASCEND) {
+                if (rank_info_.tp_rank == 0) {
+                    spdlog::warn(
+                        "Ascend graph replay is disabled for paged decode because "
+                        "the current attention path captures host-side sequence metadata; "
+                        "falling back to eager execution.");
+                }
+            } else if (enable_graph_compiling_) {
                 compiler_ = std::make_unique<GeneralCompiler>(model_, barrier_);
             }
 

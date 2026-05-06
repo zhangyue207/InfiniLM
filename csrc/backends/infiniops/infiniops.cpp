@@ -21,6 +21,7 @@
 #include "ascend/mha_varlen_fwd/kernel.h"
 #include "ascend/mul/kernel.h"
 #include "ascend/reshape_and_cache/kernel.h"
+#include "ascend/reshape_and_cache/kernel_atb.h"
 #include "ascend/rms_norm/kernel.h"
 #include "ascend/rotary_embedding/kernel.h"
 #include "ascend/swiglu/kernel.h"
@@ -300,7 +301,7 @@ void reshape_and_cache(const infinicore::Tensor &key,
                        const infinicore::Tensor &slot_mapping) {
 #ifdef INFINILM_ENABLE_INFINIOPS
     infini::ops::ReshapeAndCache::Call(
-        handle(), config(), as_tensor(key), as_tensor(value), as_tensor(kv_cache),
+        handle(), config(2), as_tensor(key), as_tensor(value), as_tensor(kv_cache),
         as_tensor(slot_mapping), as_tensor(kv_cache));
 #else
     (void)key;
@@ -352,14 +353,13 @@ void mha_varlen_fwd(const infinicore::Tensor &out,
 #ifdef INFINILM_ENABLE_INFINIOPS
     (void)max_seqlen_q;
     (void)max_seqlen_k;
-    std::optional<infini::ops::Tensor> out_opt = as_tensor(out);
     std::optional<infini::ops::Tensor> block_table_opt = as_tensor(block_table);
     std::optional<infini::ops::Tensor> no_tensor;
     std::optional<int64_t> no_generator;
     const auto actual_max_seqlen_q = max_sequence_length(cu_seqlens_q);
     const auto actual_max_seqlen_k = max_sequence_length(cu_seqlens_k);
     infini::ops::MhaVarlenFwd::Call(
-        handle(), config(), as_tensor(q), as_tensor(k), as_tensor(v), out_opt,
+        handle(), config(), as_tensor(q), as_tensor(k), as_tensor(v), as_tensor(out),
         as_tensor(cu_seqlens_q), as_tensor(cu_seqlens_k), no_tensor,
         no_tensor, block_table_opt, no_tensor, actual_max_seqlen_q, actual_max_seqlen_k,
         0.0f, softmax_scale, false, true, -1, 0, 0.0f, false, no_generator, 0);
@@ -388,12 +388,11 @@ void mha_fwd_kvcache(const infinicore::Tensor &out,
 #ifdef INFINILM_ENABLE_INFINIOPS
     std::optional<infini::ops::Tensor> seqlens_k_opt = as_tensor(seqlens_k);
     std::optional<infini::ops::Tensor> block_table_opt = as_tensor(block_table);
-    std::optional<infini::ops::Tensor> out_opt = as_tensor(out);
     std::optional<infini::ops::Tensor> no_tensor;
     infini::ops::MhaFwdKvcache::Call(
         handle(), config(), as_tensor(q), as_tensor(kcache), as_tensor(vcache),
         no_tensor, no_tensor, seqlens_k_opt, no_tensor, no_tensor,
-        no_tensor, no_tensor, block_table_opt, no_tensor, out_opt,
+        no_tensor, no_tensor, block_table_opt, no_tensor, as_tensor(out),
         softmax_scale, true, -1, 0, 0.0f, false, 0);
 #else
     (void)out;
@@ -489,6 +488,9 @@ infinicore::Tensor sample_from_logits(const infinicore::Tensor &logits,
             top_p_tensor, as_tensor(out));
     }
 
+    // ATB sampling can complete outside the stream dependency observed by the
+    // following D2H copy, so wait at device scope before reading token ids.
+    infinicore::context::syncDevice();
     auto sampled_i32_cpu = sampled_i32->to(infinicore::Device::cpu());
     infinicore::context::syncStream();
 
