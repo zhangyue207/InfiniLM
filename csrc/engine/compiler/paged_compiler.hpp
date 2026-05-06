@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../../backends/infiniops/infiniops.hpp"
 #include "graph_compiler.hpp"
 
 #include <unordered_map>
@@ -20,6 +21,9 @@ private:
 
     struct CompiledResult {
         InfinilmModel::Input input;
+        infinicore::Tensor total_sequence_lengths_host;
+        infinicore::Tensor block_tables_host;
+        backends::infiniops::GraphTaskUpdates graph_task_updates;
         Compiled compiled;
     };
 

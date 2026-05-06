@@ -2,6 +2,7 @@
 
 #include "../../../backends/infiniops/infiniops.hpp"
 #include "../../../utils.hpp"
+#include "infinicore/context/context.hpp"
 #include "infinicore/ops.hpp"
 #include "infinicore/ops/mha_kvcache.hpp"
 #include "infinicore/ops/mha_varlen.hpp"
@@ -38,6 +39,8 @@ infinicore::Tensor FlashAttentionImpl::forward(const AttentionLayer &layer,
     auto block_tables = attn_metadata.block_tables;
     auto slot_mapping = attn_metadata.slot_mapping;
     auto cu_seqlens = attn_metadata.cu_seqlens;
+    auto total_sequence_lengths_host = attn_metadata.total_sequence_lengths_host;
+    auto block_tables_host = attn_metadata.block_tables_host;
 
     ASSERT(block_tables.has_value());
     ASSERT(slot_mapping.has_value());
@@ -69,18 +72,18 @@ infinicore::Tensor FlashAttentionImpl::forward(const AttentionLayer &layer,
                 scale_);
         } else
 #endif
-        infinicore::op::mha_varlen_(
-            attn_output,
-            query,
-            k_total,
-            v_total,
-            input_offsets.value(),
-            cu_seqlens.value(),
-            block_tables.value(),
-            max_position_embeddings_,
-            max_position_embeddings_,
-            std::nullopt,
-            scale_);
+            infinicore::op::mha_varlen_(
+                attn_output,
+                query,
+                k_total,
+                v_total,
+                input_offsets.value(),
+                cu_seqlens.value(),
+                block_tables.value(),
+                max_position_embeddings_,
+                max_position_embeddings_,
+                std::nullopt,
+                scale_);
     } else {
         // FA2 decode path: flash::mha_fwd_kvcache
         // In paged-attn mode, seq_len = actual batch_size (one query token per sequence).
@@ -88,27 +91,49 @@ infinicore::Tensor FlashAttentionImpl::forward(const AttentionLayer &layer,
         auto q_for_fa = query->view({seq_len, 1, num_heads_, head_dim_});
 #ifdef INFINILM_ENABLE_INFINIOPS
         if (infinilm::backends::infiniops::should_use(query->device())) {
-            auto attn_out_4d = infinicore::Tensor::empty(q_for_fa->shape(), q_for_fa->dtype(), q_for_fa->device());
-            infinilm::backends::infiniops::mha_fwd_kvcache(
-                attn_out_4d,
-                q_for_fa,
-                k_total,
-                v_total,
-                total_sequence_lengths.value(),
-                block_tables.value(),
-                scale_);
-            attn_output = attn_out_4d->view({seq_len, num_heads_, head_dim_});
+            const auto block_size = static_cast<int64_t>(k_total->size(1));
+            if (block_size <= 128) {
+                if (infinicore::context::isGraphRecording()
+                    && (!total_sequence_lengths_host.has_value() || !block_tables_host.has_value())) {
+                    throw std::runtime_error(
+                        "Ascend graph decode requires CPU mirrors for paged attention metadata.");
+                }
+                infinilm::backends::infiniops::paged_attention(
+                    attn_output,
+                    query,
+                    k_total,
+                    v_total,
+                    total_sequence_lengths.value(),
+                    block_tables.value(),
+                    static_cast<int64_t>(num_heads_),
+                    static_cast<int64_t>(num_kv_heads_),
+                    static_cast<int64_t>(head_dim_),
+                    scale_,
+                    total_sequence_lengths_host,
+                    block_tables_host);
+            } else {
+                auto attn_out_4d = infinicore::Tensor::empty(q_for_fa->shape(), q_for_fa->dtype(), q_for_fa->device());
+                infinilm::backends::infiniops::mha_fwd_kvcache(
+                    attn_out_4d,
+                    q_for_fa,
+                    k_total,
+                    v_total,
+                    total_sequence_lengths.value(),
+                    block_tables.value(),
+                    scale_);
+                attn_output = attn_out_4d->view({seq_len, num_heads_, head_dim_});
+            }
         } else {
 #endif
-        auto attn_out_4d = infinicore::op::mha_kvcache(
-            q_for_fa,
-            k_total, // [num_blocks, block_size, num_kv_heads, head_dim]
-            v_total,
-            total_sequence_lengths.value(), // [seq_len] int32 (one entry per sequence)
-            block_tables.value(),           // [seq_len, max_num_blocks_per_seq] int32
-            std::nullopt,
-            scale_);
-        attn_output = attn_out_4d->view({seq_len, num_heads_, head_dim_});
+            auto attn_out_4d = infinicore::op::mha_kvcache(
+                q_for_fa,
+                k_total, // [num_blocks, block_size, num_kv_heads, head_dim]
+                v_total,
+                total_sequence_lengths.value(), // [seq_len] int32 (one entry per sequence)
+                block_tables.value(),           // [seq_len, max_num_blocks_per_seq] int32
+                std::nullopt,
+                scale_);
+            attn_output = attn_out_4d->view({seq_len, num_heads_, head_dim_});
 #ifdef INFINILM_ENABLE_INFINIOPS
         }
 #endif

@@ -158,6 +158,8 @@ InferEngine::Input::to_model_input(infinicore::Device device) const {
         input.cu_seqlens,
         input.block_tables,
         input.slot_mapping,
+        total_sequence_lengths,
+        block_tables,
     };
     return input;
 }

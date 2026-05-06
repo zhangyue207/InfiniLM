@@ -6,11 +6,22 @@
 #include "infinicore/nn/rmsnorm.hpp"
 #include "infinicore/tensor.hpp"
 
+#include <memory>
 #include <optional>
+#include <vector>
 
 namespace infinilm::backends::infiniops {
 
+struct GraphTaskUpdate;
+using GraphTaskUpdates = std::vector<std::shared_ptr<GraphTaskUpdate>>;
+
 bool should_use(const infinicore::Device &device);
+
+void begin_graph_task_capture();
+
+GraphTaskUpdates end_graph_task_capture();
+
+void update_graph_tasks(const GraphTaskUpdates &updates);
 
 infinicore::Tensor embedding(const infinicore::Tensor &input_ids,
                              const infinicore::Tensor &weight);
@@ -63,6 +74,19 @@ void mha_fwd_kvcache(const infinicore::Tensor &out,
                      const infinicore::Tensor &seqlens_k,
                      const infinicore::Tensor &block_table,
                      float softmax_scale);
+
+void paged_attention(const infinicore::Tensor &out,
+                     const infinicore::Tensor &q,
+                     const infinicore::Tensor &kcache,
+                     const infinicore::Tensor &vcache,
+                     const infinicore::Tensor &seqlens_k,
+                     const infinicore::Tensor &block_table,
+                     int64_t num_heads,
+                     int64_t num_kv_heads,
+                     int64_t head_size,
+                     float softmax_scale,
+                     std::optional<infinicore::Tensor> seqlens_k_host = std::nullopt,
+                     std::optional<infinicore::Tensor> block_table_host = std::nullopt);
 
 infinicore::Tensor sample_from_logits(const infinicore::Tensor &logits,
                                       const infinicore::Tensor &input_offsets,

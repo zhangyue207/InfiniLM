@@ -1,6 +1,7 @@
 #include "infiniops.hpp"
 
 #include "infinicore/context/context.hpp"
+#include "infinicore/graph/graph.hpp"
 #include "infinicore/ops/distributed/allreduce.hpp"
 
 #include <algorithm>
@@ -8,11 +9,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #ifdef INFINILM_ENABLE_INFINIOPS
+#include "acl/acl_rt.h"
 #include "ascend/add_rms_norm/kernel.h"
 #include "ascend/device_.h"
 #include "ascend/embedding/kernel.h"
@@ -20,15 +24,25 @@
 #include "ascend/mha_fwd_kvcache/kernel.h"
 #include "ascend/mha_varlen_fwd/kernel.h"
 #include "ascend/mul/kernel.h"
+#include "ascend/paged_attention/kernel_atb.h"
 #include "ascend/reshape_and_cache/kernel.h"
 #include "ascend/reshape_and_cache/kernel_atb.h"
 #include "ascend/rms_norm/kernel.h"
 #include "ascend/rotary_embedding/kernel.h"
 #include "ascend/swiglu/kernel.h"
+#include "ascend/top_k_top_p_sampler/kernel.h"
 #include "ascend/top_k_top_p_sampler/kernel_atb.h"
 #endif
 
 namespace infinilm::backends::infiniops {
+
+struct GraphTaskUpdate {
+    std::function<void()> runner;
+#ifdef INFINILM_ENABLE_INFINIOPS
+    aclrtTaskGrp handle = nullptr;
+#endif
+};
+
 namespace {
 
 #ifdef INFINILM_ENABLE_INFINIOPS
@@ -103,6 +117,72 @@ infini::ops::Config config(std::size_t implementation_index = 0) {
     infini::ops::Config cfg;
     cfg.set_implementation_index(implementation_index);
     return cfg;
+}
+
+thread_local GraphTaskUpdates *active_graph_task_capture = nullptr;
+
+bool is_ri_capturing() {
+    aclmdlRICaptureStatus status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI model_ri = nullptr;
+    auto ret = aclmdlRICaptureGetInfo(
+        static_cast<aclrtStream>(infinicore::context::getStream()),
+        &status,
+        &model_ri);
+    return ret == ACL_SUCCESS && status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
+}
+
+class InfiniOpsGraphOperator : public infinicore::graph::GraphOperator {
+public:
+    explicit InfiniOpsGraphOperator(std::function<void()> runner,
+                                    std::shared_ptr<GraphTaskUpdate> graph_task_update = nullptr)
+        : runner_(std::move(runner)),
+          graph_task_update_(std::move(graph_task_update)) {}
+
+    void run() const override {
+#ifdef INFINILM_ENABLE_INFINIOPS
+        if (graph_task_update_ && is_ri_capturing()) {
+            auto stream = static_cast<aclrtStream>(infinicore::context::getStream());
+            auto ret = aclmdlRICaptureTaskGrpBegin(stream);
+            if (ret != ACL_SUCCESS) {
+                throw std::runtime_error("InfiniOps adapter: aclmdlRICaptureTaskGrpBegin failed");
+            }
+            runner_();
+            aclrtTaskGrp handle = nullptr;
+            ret = aclmdlRICaptureTaskGrpEnd(stream, &handle);
+            if (ret != ACL_SUCCESS) {
+                throw std::runtime_error("InfiniOps adapter: aclmdlRICaptureTaskGrpEnd failed");
+            }
+            graph_task_update_->handle = handle;
+            return;
+        }
+#endif
+        runner_();
+    }
+
+private:
+    std::function<void()> runner_;
+    std::shared_ptr<GraphTaskUpdate> graph_task_update_;
+};
+
+void record_or_run(std::function<void()> runner,
+                   std::shared_ptr<GraphTaskUpdate> graph_task_update = nullptr) {
+    if (infinicore::context::isGraphRecording()) {
+        infinicore::context::addGraphOperator(
+            std::make_shared<InfiniOpsGraphOperator>(std::move(runner), graph_task_update));
+        return;
+    }
+
+    runner();
+}
+
+void record_or_run_updatable(std::function<void()> runner) {
+    std::shared_ptr<GraphTaskUpdate> update;
+    if (infinicore::context::isGraphRecording() && active_graph_task_capture != nullptr) {
+        update = std::make_shared<GraphTaskUpdate>();
+        update->runner = runner;
+        active_graph_task_capture->push_back(update);
+    }
+    record_or_run(std::move(runner), std::move(update));
 }
 
 bool unquantized(const infinicore::nn::BaseLinear &linear) {
@@ -211,6 +291,51 @@ bool should_use(const infinicore::Device &device) {
 #endif
 }
 
+void begin_graph_task_capture() {
+#ifdef INFINILM_ENABLE_INFINIOPS
+    if (active_graph_task_capture != nullptr) {
+        throw std::runtime_error("InfiniOps adapter: graph task capture is already active");
+    }
+    active_graph_task_capture = new GraphTaskUpdates();
+#endif
+}
+
+GraphTaskUpdates end_graph_task_capture() {
+#ifdef INFINILM_ENABLE_INFINIOPS
+    if (active_graph_task_capture == nullptr) {
+        return {};
+    }
+    GraphTaskUpdates updates = std::move(*active_graph_task_capture);
+    delete active_graph_task_capture;
+    active_graph_task_capture = nullptr;
+    return updates;
+#else
+    return {};
+#endif
+}
+
+void update_graph_tasks(const GraphTaskUpdates &updates) {
+#ifdef INFINILM_ENABLE_INFINIOPS
+    auto stream = static_cast<aclrtStream>(infinicore::context::getStream());
+    for (const auto &update : updates) {
+        if (!update || update->handle == nullptr || !update->runner) {
+            continue;
+        }
+        auto ret = aclmdlRICaptureTaskUpdateBegin(stream, update->handle);
+        if (ret != ACL_SUCCESS) {
+            throw std::runtime_error("InfiniOps adapter: aclmdlRICaptureTaskUpdateBegin failed");
+        }
+        update->runner();
+        ret = aclmdlRICaptureTaskUpdateEnd(stream);
+        if (ret != ACL_SUCCESS) {
+            throw std::runtime_error("InfiniOps adapter: aclmdlRICaptureTaskUpdateEnd failed");
+        }
+    }
+#else
+    (void)updates;
+#endif
+}
+
 infinicore::Tensor embedding(const infinicore::Tensor &input_ids,
                              const infinicore::Tensor &weight) {
 #ifdef INFINILM_ENABLE_INFINIOPS
@@ -219,7 +344,12 @@ infinicore::Tensor embedding(const infinicore::Tensor &input_ids,
     std::vector<std::size_t> out_shape(input_ids->shape().begin(), input_ids->shape().end());
     out_shape.push_back(weight->size(1));
     auto out = infinicore::Tensor::empty(out_shape, weight->dtype(), weight->device());
-    infini::ops::Embedding::Call(handle(), config(), as_tensor(input_ids), as_tensor(weight), as_tensor(out));
+    auto input_ids_g = infinicore::graph::GraphTensor(input_ids);
+    auto weight_g = infinicore::graph::GraphTensor(weight);
+    auto out_g = infinicore::graph::GraphTensor(out);
+    record_or_run([input_ids_g, weight_g, out_g]() {
+        infini::ops::Embedding::Call(handle(), config(), as_tensor(input_ids_g), as_tensor(weight_g), as_tensor(out_g));
+    });
     return out;
 #else
     require_enabled();
@@ -239,9 +369,22 @@ infinicore::Tensor linear(const infinicore::Tensor &input,
     std::vector<std::size_t> out_shape(input_contiguous->shape().begin(), input_contiguous->shape().end());
     out_shape.back() = weight_contiguous->size(weight_contiguous->ndim() - 2);
     auto out = infinicore::Tensor::empty(out_shape, input_contiguous->dtype(), input_contiguous->device());
-    infini::ops::Linear::Call(
-        handle(), config(), as_tensor(input_contiguous), as_tensor(weight_contiguous),
-        as_optional_tensor(bias), as_tensor(out));
+    auto input_g = infinicore::graph::GraphTensor(input_contiguous);
+    auto weight_g = infinicore::graph::GraphTensor(weight_contiguous);
+    auto out_g = infinicore::graph::GraphTensor(out);
+    std::optional<infinicore::graph::GraphTensor> bias_g;
+    if (bias.has_value()) {
+        bias_g.emplace(bias.value());
+    }
+    record_or_run([input_g, weight_g, bias_g, out_g]() {
+        std::optional<infini::ops::Tensor> bias_opt;
+        if (bias_g.has_value()) {
+            bias_opt.emplace(as_tensor(bias_g.value()));
+        }
+        infini::ops::Linear::Call(
+            handle(), config(), as_tensor(input_g), as_tensor(weight_g),
+            bias_opt, as_tensor(out_g));
+    });
     return out;
 #else
     require_enabled();
@@ -254,7 +397,12 @@ void rms_norm_(const infinicore::Tensor &out,
                const infinicore::Tensor &weight,
                float eps) {
 #ifdef INFINILM_ENABLE_INFINIOPS
-    infini::ops::RmsNorm::Call(handle(), config(), as_tensor(input), as_tensor(weight), eps, as_tensor(out));
+    auto input_g = infinicore::graph::GraphTensor(input);
+    auto weight_g = infinicore::graph::GraphTensor(weight);
+    auto out_g = infinicore::graph::GraphTensor(out);
+    record_or_run([input_g, weight_g, out_g, eps]() {
+        infini::ops::RmsNorm::Call(handle(), config(), as_tensor(input_g), as_tensor(weight_g), eps, as_tensor(out_g));
+    });
 #else
     (void)out;
     (void)input;
@@ -270,9 +418,15 @@ void add_rms_norm_(infinicore::Tensor &input,
                    float eps) {
 #ifdef INFINILM_ENABLE_INFINIOPS
     auto residual_out = infinicore::Tensor::empty(residual->shape(), residual->dtype(), residual->device());
-    infini::ops::AddRmsNorm::Call(
-        handle(), config(), as_tensor(input), as_tensor(residual), as_tensor(weight), eps,
-        as_tensor(input), as_tensor(residual_out));
+    auto input_g = infinicore::graph::GraphTensor(input);
+    auto residual_g = infinicore::graph::GraphTensor(residual);
+    auto weight_g = infinicore::graph::GraphTensor(weight);
+    auto residual_out_g = infinicore::graph::GraphTensor(residual_out);
+    record_or_run([input_g, residual_g, weight_g, residual_out_g, eps]() {
+        infini::ops::AddRmsNorm::Call(
+            handle(), config(), as_tensor(input_g), as_tensor(residual_g), as_tensor(weight_g), eps,
+            as_tensor(input_g), as_tensor(residual_out_g));
+    });
     residual = residual_out;
 #else
     (void)input;
@@ -287,7 +441,12 @@ infinicore::Tensor swiglu(const infinicore::Tensor &up,
                           const infinicore::Tensor &gate) {
 #ifdef INFINILM_ENABLE_INFINIOPS
     auto out = infinicore::Tensor::empty(up->shape(), up->dtype(), up->device());
-    infini::ops::Swiglu::Call(handle(), config(), as_tensor(up), as_tensor(gate), as_tensor(out));
+    auto up_g = infinicore::graph::GraphTensor(up);
+    auto gate_g = infinicore::graph::GraphTensor(gate);
+    auto out_g = infinicore::graph::GraphTensor(out);
+    record_or_run([up_g, gate_g, out_g]() {
+        infini::ops::Swiglu::Call(handle(), config(), as_tensor(up_g), as_tensor(gate_g), as_tensor(out_g));
+    });
     return out;
 #else
     require_enabled();
@@ -300,9 +459,15 @@ void reshape_and_cache(const infinicore::Tensor &key,
                        const infinicore::Tensor &kv_cache,
                        const infinicore::Tensor &slot_mapping) {
 #ifdef INFINILM_ENABLE_INFINIOPS
-    infini::ops::ReshapeAndCache::Call(
-        handle(), config(2), as_tensor(key), as_tensor(value), as_tensor(kv_cache),
-        as_tensor(slot_mapping), as_tensor(kv_cache));
+    auto key_g = infinicore::graph::GraphTensor(key);
+    auto value_g = infinicore::graph::GraphTensor(value);
+    auto kv_cache_g = infinicore::graph::GraphTensor(kv_cache);
+    auto slot_mapping_g = infinicore::graph::GraphTensor(slot_mapping);
+    record_or_run([key_g, value_g, kv_cache_g, slot_mapping_g]() {
+        infini::ops::ReshapeAndCache::Call(
+            handle(), config(2), as_tensor(key_g), as_tensor(value_g), as_tensor(kv_cache_g),
+            as_tensor(slot_mapping_g), as_tensor(kv_cache_g));
+    });
 #else
     (void)key;
     (void)value;
@@ -320,14 +485,33 @@ void rotary_embedding(const infinicore::Tensor &positions,
                       std::optional<infinicore::Tensor> query_out,
                       std::optional<infinicore::Tensor> key_out) {
 #ifdef INFINILM_ENABLE_INFINIOPS
-    std::optional<infini::ops::Tensor> key_opt = as_tensor(key);
-    std::optional<infini::ops::Tensor> query_out_opt = as_optional_tensor(query_out);
-    std::optional<infini::ops::Tensor> key_out_opt = as_optional_tensor(key_out);
-
-    infini::ops::RotaryEmbedding::Call(
-        handle(), config(), as_tensor(positions), as_tensor(query), key_opt,
-        head_size, as_tensor(cos_sin_cache), true, head_size,
-        query_out_opt, key_out_opt, false);
+    auto positions_g = infinicore::graph::GraphTensor(positions);
+    auto query_g = infinicore::graph::GraphTensor(query);
+    auto key_g = infinicore::graph::GraphTensor(key);
+    auto cos_sin_cache_g = infinicore::graph::GraphTensor(cos_sin_cache);
+    std::optional<infinicore::graph::GraphTensor> query_out_g;
+    std::optional<infinicore::graph::GraphTensor> key_out_g;
+    if (query_out.has_value()) {
+        query_out_g.emplace(query_out.value());
+    }
+    if (key_out.has_value()) {
+        key_out_g.emplace(key_out.value());
+    }
+    record_or_run([positions_g, query_g, key_g, cos_sin_cache_g, head_size, query_out_g, key_out_g]() {
+        std::optional<infini::ops::Tensor> key_opt = as_tensor(key_g);
+        std::optional<infini::ops::Tensor> query_out_opt;
+        std::optional<infini::ops::Tensor> key_out_opt;
+        if (query_out_g.has_value()) {
+            query_out_opt.emplace(as_tensor(query_out_g.value()));
+        }
+        if (key_out_g.has_value()) {
+            key_out_opt.emplace(as_tensor(key_out_g.value()));
+        }
+        infini::ops::RotaryEmbedding::Call(
+            handle(), config(), as_tensor(positions_g), as_tensor(query_g), key_opt,
+            head_size, as_tensor(cos_sin_cache_g), true, head_size,
+            query_out_opt, key_out_opt, false);
+    });
 #else
     (void)positions;
     (void)query;
@@ -353,16 +537,26 @@ void mha_varlen_fwd(const infinicore::Tensor &out,
 #ifdef INFINILM_ENABLE_INFINIOPS
     (void)max_seqlen_q;
     (void)max_seqlen_k;
-    std::optional<infini::ops::Tensor> block_table_opt = as_tensor(block_table);
-    std::optional<infini::ops::Tensor> no_tensor;
-    std::optional<int64_t> no_generator;
     const auto actual_max_seqlen_q = max_sequence_length(cu_seqlens_q);
     const auto actual_max_seqlen_k = max_sequence_length(cu_seqlens_k);
-    infini::ops::MhaVarlenFwd::Call(
-        handle(), config(), as_tensor(q), as_tensor(k), as_tensor(v), as_tensor(out),
-        as_tensor(cu_seqlens_q), as_tensor(cu_seqlens_k), no_tensor,
-        no_tensor, block_table_opt, no_tensor, actual_max_seqlen_q, actual_max_seqlen_k,
-        0.0f, softmax_scale, false, true, -1, 0, 0.0f, false, no_generator, 0);
+    auto q_g = infinicore::graph::GraphTensor(q);
+    auto k_g = infinicore::graph::GraphTensor(k);
+    auto v_g = infinicore::graph::GraphTensor(v);
+    auto out_g = infinicore::graph::GraphTensor(out);
+    auto cu_seqlens_q_g = infinicore::graph::GraphTensor(cu_seqlens_q);
+    auto cu_seqlens_k_g = infinicore::graph::GraphTensor(cu_seqlens_k);
+    auto block_table_g = infinicore::graph::GraphTensor(block_table);
+    record_or_run([q_g, k_g, v_g, out_g, cu_seqlens_q_g, cu_seqlens_k_g, block_table_g,
+                   actual_max_seqlen_q, actual_max_seqlen_k, softmax_scale]() {
+        std::optional<infini::ops::Tensor> block_table_opt = as_tensor(block_table_g);
+        std::optional<infini::ops::Tensor> no_tensor;
+        std::optional<int64_t> no_generator;
+        infini::ops::MhaVarlenFwd::Call(
+            handle(), config(), as_tensor(q_g), as_tensor(k_g), as_tensor(v_g), as_tensor(out_g),
+            as_tensor(cu_seqlens_q_g), as_tensor(cu_seqlens_k_g), no_tensor,
+            no_tensor, block_table_opt, no_tensor, actual_max_seqlen_q, actual_max_seqlen_k,
+            0.0f, softmax_scale, false, true, -1, 0, 0.0f, false, no_generator, 0);
+    });
 #else
     (void)out;
     (void)q;
@@ -386,14 +580,22 @@ void mha_fwd_kvcache(const infinicore::Tensor &out,
                      const infinicore::Tensor &block_table,
                      float softmax_scale) {
 #ifdef INFINILM_ENABLE_INFINIOPS
-    std::optional<infini::ops::Tensor> seqlens_k_opt = as_tensor(seqlens_k);
-    std::optional<infini::ops::Tensor> block_table_opt = as_tensor(block_table);
-    std::optional<infini::ops::Tensor> no_tensor;
-    infini::ops::MhaFwdKvcache::Call(
-        handle(), config(), as_tensor(q), as_tensor(kcache), as_tensor(vcache),
-        no_tensor, no_tensor, seqlens_k_opt, no_tensor, no_tensor,
-        no_tensor, no_tensor, block_table_opt, no_tensor, as_tensor(out),
-        softmax_scale, true, -1, 0, 0.0f, false, 0);
+    auto out_g = infinicore::graph::GraphTensor(out);
+    auto q_g = infinicore::graph::GraphTensor(q);
+    auto kcache_g = infinicore::graph::GraphTensor(kcache);
+    auto vcache_g = infinicore::graph::GraphTensor(vcache);
+    auto seqlens_k_g = infinicore::graph::GraphTensor(seqlens_k);
+    auto block_table_g = infinicore::graph::GraphTensor(block_table);
+    record_or_run_updatable([out_g, q_g, kcache_g, vcache_g, seqlens_k_g, block_table_g, softmax_scale]() {
+        std::optional<infini::ops::Tensor> seqlens_k_opt = as_tensor(seqlens_k_g);
+        std::optional<infini::ops::Tensor> block_table_opt = as_tensor(block_table_g);
+        std::optional<infini::ops::Tensor> no_tensor;
+        infini::ops::MhaFwdKvcache::Call(
+            handle(), config(), as_tensor(q_g), as_tensor(kcache_g), as_tensor(vcache_g),
+            no_tensor, no_tensor, seqlens_k_opt, no_tensor, no_tensor,
+            no_tensor, no_tensor, block_table_opt, no_tensor, as_tensor(out_g),
+            softmax_scale, true, -1, 0, 0.0f, false, 0);
+    });
 #else
     (void)out;
     (void)q;
@@ -402,6 +604,60 @@ void mha_fwd_kvcache(const infinicore::Tensor &out,
     (void)seqlens_k;
     (void)block_table;
     (void)softmax_scale;
+    require_enabled();
+#endif
+}
+
+void paged_attention(const infinicore::Tensor &out,
+                     const infinicore::Tensor &q,
+                     const infinicore::Tensor &kcache,
+                     const infinicore::Tensor &vcache,
+                     const infinicore::Tensor &seqlens_k,
+                     const infinicore::Tensor &block_table,
+                     int64_t num_heads,
+                     int64_t num_kv_heads,
+                     int64_t head_size,
+                     float softmax_scale,
+                     std::optional<infinicore::Tensor> seqlens_k_host,
+                     std::optional<infinicore::Tensor> block_table_host) {
+#ifdef INFINILM_ENABLE_INFINIOPS
+    const auto block_size = static_cast<int64_t>(kcache->size(1));
+    auto out_g = infinicore::graph::GraphTensor(out);
+    auto q_g = infinicore::graph::GraphTensor(q);
+    auto kcache_g = infinicore::graph::GraphTensor(kcache);
+    auto vcache_g = infinicore::graph::GraphTensor(vcache);
+    auto seqlens_k_g = infinicore::graph::GraphTensor(seqlens_k);
+    auto block_table_g = infinicore::graph::GraphTensor(block_table);
+    record_or_run_updatable([out_g, q_g, kcache_g, vcache_g, seqlens_k_g, block_table_g,
+                             num_heads, num_kv_heads, head_size, softmax_scale, block_size,
+                             seqlens_k_host, block_table_host]() {
+        std::optional<infini::ops::Tensor> seq_lens_host_opt;
+        std::optional<infini::ops::Tensor> block_table_host_opt;
+        if (seqlens_k_host.has_value()) {
+            seq_lens_host_opt.emplace(as_tensor(seqlens_k_host.value()));
+        }
+        if (block_table_host.has_value()) {
+            block_table_host_opt.emplace(as_tensor(block_table_host.value()));
+        }
+        infini::ops::PagedAttention::Call(
+            handle(), config(), as_tensor(q_g), as_tensor(kcache_g), as_tensor(vcache_g),
+            as_tensor(seqlens_k_g), as_tensor(block_table_g), num_heads, num_kv_heads,
+            head_size, static_cast<double>(softmax_scale), block_size, as_tensor(out_g),
+            seq_lens_host_opt, block_table_host_opt);
+    });
+#else
+    (void)out;
+    (void)q;
+    (void)kcache;
+    (void)vcache;
+    (void)seqlens_k;
+    (void)block_table;
+    (void)num_heads;
+    (void)num_kv_heads;
+    (void)head_size;
+    (void)softmax_scale;
+    (void)seqlens_k_host;
+    (void)block_table_host;
     require_enabled();
 #endif
 }
@@ -483,8 +739,9 @@ infinicore::Tensor sample_from_logits(const infinicore::Tensor &logits,
         }
 
         auto out = sampled_i32->narrow({{0, i, 1}});
+        const auto sampler_config = top_k == 1 ? config() : config(1);
         infini::ops::TopKTopPSampler::Call(
-            handle(), config(), as_tensor(sampler_logits), top_k_tensor,
+            handle(), sampler_config, as_tensor(sampler_logits), top_k_tensor,
             top_p_tensor, as_tensor(out));
     }
 

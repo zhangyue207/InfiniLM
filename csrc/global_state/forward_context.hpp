@@ -17,6 +17,10 @@ struct AttentionMetadata {
     std::optional<infinicore::Tensor> block_tables;
     /// Slot ids for each token `[seq]`. Used for paged cache.
     std::optional<infinicore::Tensor> slot_mapping;
+    /// CPU mirror of total sequence lengths for Ascend paged attention.
+    std::optional<infinicore::Tensor> total_sequence_lengths_host;
+    /// CPU mirror of block ids for Ascend paged attention.
+    std::optional<infinicore::Tensor> block_tables_host;
 
     AttentionMetadata() = default;
 
@@ -25,12 +29,16 @@ struct AttentionMetadata {
                       std::optional<infinicore::Tensor> input_offsets,
                       std::optional<infinicore::Tensor> cu_seqlens,
                       std::optional<infinicore::Tensor> block_tables,
-                      std::optional<infinicore::Tensor> slot_mapping) : past_sequence_lengths(past_sequence_lengths),
-                                                                        total_sequence_lengths(total_sequence_lengths),
-                                                                        input_offsets(input_offsets),
-                                                                        cu_seqlens(cu_seqlens),
-                                                                        block_tables(block_tables),
-                                                                        slot_mapping(slot_mapping) {}
+                      std::optional<infinicore::Tensor> slot_mapping,
+                      std::optional<infinicore::Tensor> total_sequence_lengths_host = std::nullopt,
+                      std::optional<infinicore::Tensor> block_tables_host = std::nullopt) : past_sequence_lengths(past_sequence_lengths),
+                                                                                            total_sequence_lengths(total_sequence_lengths),
+                                                                                            input_offsets(input_offsets),
+                                                                                            cu_seqlens(cu_seqlens),
+                                                                                            block_tables(block_tables),
+                                                                                            slot_mapping(slot_mapping),
+                                                                                            total_sequence_lengths_host(total_sequence_lengths_host),
+                                                                                            block_tables_host(block_tables_host) {}
 
     AttentionMetadata(const infinilm::InfinilmModel::Input &input) : AttentionMetadata(input.past_sequence_lengths,
                                                                                        input.total_sequence_lengths,
