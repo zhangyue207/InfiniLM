@@ -7,6 +7,18 @@
 #include "infinicore/ops/mha_kvcache.hpp"
 #include "infinicore/ops/mha_varlen.hpp"
 
+#include <cstdlib>
+#include <cstring>
+
+namespace {
+
+bool should_use_atb_decode_attention() {
+    const char *impl = std::getenv("INFINILM_ASCEND_DECODE_ATTENTION_IMPL");
+    return impl != nullptr && std::strcmp(impl, "atb") == 0;
+}
+
+} // namespace
+
 namespace infinilm::layers::attention::backends {
 
 FlashAttentionImpl::FlashAttentionImpl(size_t num_heads,
@@ -91,8 +103,7 @@ infinicore::Tensor FlashAttentionImpl::forward(const AttentionLayer &layer,
         auto q_for_fa = query->view({seq_len, 1, num_heads_, head_dim_});
 #ifdef INFINILM_ENABLE_INFINIOPS
         if (infinilm::backends::infiniops::should_use(query->device())) {
-            const auto block_size = static_cast<int64_t>(k_total->size(1));
-            if (block_size <= 128) {
+            if (should_use_atb_decode_attention()) {
                 if (infinicore::context::isGraphRecording()
                     && (!total_sequence_lengths_host.has_value() || !block_tables_host.has_value())) {
                     throw std::runtime_error(
@@ -112,6 +123,13 @@ infinicore::Tensor FlashAttentionImpl::forward(const AttentionLayer &layer,
                     total_sequence_lengths_host,
                     block_tables_host);
             } else {
+                // Default Ascend decode uses ACLNN FIA V4.  Set
+                // `INFINILM_ASCEND_DECODE_ATTENTION_IMPL=atb` only for
+                // focused ATB comparison.
+                if (infinicore::context::isGraphRecording() && !total_sequence_lengths_host.has_value()) {
+                    throw std::runtime_error(
+                        "Ascend graph decode with ACLNN FIA requires a CPU mirror for sequence lengths.");
+                }
                 auto attn_out_4d = infinicore::Tensor::empty(q_for_fa->shape(), q_for_fa->dtype(), q_for_fa->device());
                 infinilm::backends::infiniops::mha_fwd_kvcache(
                     attn_out_4d,
@@ -120,7 +138,8 @@ infinicore::Tensor FlashAttentionImpl::forward(const AttentionLayer &layer,
                     v_total,
                     total_sequence_lengths.value(),
                     block_tables.value(),
-                    scale_);
+                    scale_,
+                    total_sequence_lengths_host);
                 attn_output = attn_out_4d->view({seq_len, num_heads_, head_dim_});
             }
         } else {

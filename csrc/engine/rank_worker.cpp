@@ -5,30 +5,11 @@
 #include "../models/model_factory.hpp"
 #include "../models/models_registry.hpp"
 #include "infinicore/ops.hpp"
-#include <cstdlib>
 #include <iostream>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
 
 namespace infinilm::engine {
-namespace {
-
-int ascend_graph_max_tp_size() {
-    constexpr int kDefaultMaxTpSize = 2;
-    const char *value = std::getenv("INFINILM_ASCEND_GRAPH_MAX_TP_SIZE");
-    if (value == nullptr || *value == '\0') {
-        return kDefaultMaxTpSize;
-    }
-
-    char *end = nullptr;
-    const long parsed = std::strtol(value, &end, 10);
-    if (end == value || *end != '\0' || parsed < 1) {
-        return kDefaultMaxTpSize;
-    }
-    return static_cast<int>(parsed);
-}
-
-} // namespace
 
 /**
  * @deprecated This function is deprecated and will be REMOVED in the next major release (v0.2.0).
@@ -300,23 +281,7 @@ void RankWorker::thread_loop() {
             if (!model_) {
                 throw std::runtime_error("Failed to create model");
             }
-            const bool is_ascend_graph = enable_graph_compiling_ && rank_info_.device.getType() == infinicore::Device::Type::ASCEND;
-            // Ascend graph currently fails when tensor parallelism exceeds 2. This was reproduced on
-            // 9g_8b_thinking_llama and Qwen2.5-7B-Instruct: TP2 graph completes, while TP4 graph
-            // hangs or fails during graph compile unless we fall back to eager execution. The env
-            // override is for diagnostics only, so keep the default conservative until TP>2 graph
-            // capture/compile is fixed.
-            const int ascend_graph_tp_limit = is_ascend_graph ? ascend_graph_max_tp_size() : 0;
-            if (is_ascend_graph && rank_info_.tp_size > ascend_graph_tp_limit) {
-                if (rank_info_.tp_rank == 0) {
-                    spdlog::warn(
-                        "Ascend graph replay is disabled for tp_size={} > supported max {}. "
-                        "Set INFINILM_ASCEND_GRAPH_MAX_TP_SIZE={} for a diagnostic graph run.",
-                        rank_info_.tp_size,
-                        ascend_graph_tp_limit,
-                        rank_info_.tp_size);
-                }
-            } else if (enable_graph_compiling_) {
+            if (enable_graph_compiling_) {
                 compiler_ = std::make_unique<GeneralCompiler>(model_, barrier_);
             }
 

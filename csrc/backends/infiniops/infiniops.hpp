@@ -73,7 +73,8 @@ void mha_fwd_kvcache(const infinicore::Tensor &out,
                      const infinicore::Tensor &vcache,
                      const infinicore::Tensor &seqlens_k,
                      const infinicore::Tensor &block_table,
-                     float softmax_scale);
+                     float softmax_scale,
+                     std::optional<infinicore::Tensor> seqlens_k_host = std::nullopt);
 
 void paged_attention(const infinicore::Tensor &out,
                      const infinicore::Tensor &q,

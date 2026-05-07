@@ -20,6 +20,7 @@
 #include "ascend/add_rms_norm/kernel.h"
 #include "ascend/device_.h"
 #include "ascend/embedding/kernel.h"
+#include "ascend/graph_cleanup_.h"
 #include "ascend/linear/kernel.h"
 #include "ascend/mha_fwd_kvcache/kernel.h"
 #include "ascend/mha_varlen_fwd/kernel.h"
@@ -38,9 +39,18 @@ namespace infinilm::backends::infiniops {
 
 struct GraphTaskUpdate {
     std::function<void()> runner;
+    bool defer_acl_cleanup = false;
+    std::vector<std::function<void()>> pending_acl_cleanups;
 #ifdef INFINILM_ENABLE_INFINIOPS
     aclrtTaskGrp handle = nullptr;
 #endif
+
+    void run_pending_acl_cleanups() {
+        for (auto &cleanup : pending_acl_cleanups) {
+            cleanup();
+        }
+        pending_acl_cleanups.clear();
+    }
 };
 
 namespace {
@@ -134,9 +144,11 @@ bool is_ri_capturing() {
 class InfiniOpsGraphOperator : public infinicore::graph::GraphOperator {
 public:
     explicit InfiniOpsGraphOperator(std::function<void()> runner,
-                                    std::shared_ptr<GraphTaskUpdate> graph_task_update = nullptr)
+                                    std::shared_ptr<GraphTaskUpdate> graph_task_update = nullptr,
+                                    bool defer_acl_cleanup = false)
         : runner_(std::move(runner)),
-          graph_task_update_(std::move(graph_task_update)) {}
+          graph_task_update_(std::move(graph_task_update)),
+          defer_acl_cleanup_(defer_acl_cleanup) {}
 
     void run() const override {
 #ifdef INFINILM_ENABLE_INFINIOPS
@@ -146,9 +158,18 @@ public:
             if (ret != ACL_SUCCESS) {
                 throw std::runtime_error("InfiniOps adapter: aclmdlRICaptureTaskGrpBegin failed");
             }
-            runner_();
             aclrtTaskGrp handle = nullptr;
-            ret = aclmdlRICaptureTaskGrpEnd(stream, &handle);
+            if (defer_acl_cleanup_) {
+                infini::ops::ascend::DeferredAclCleanupScope cleanup_scope;
+                runner_();
+                ret = aclmdlRICaptureTaskGrpEnd(stream, &handle);
+                if (ret == ACL_SUCCESS && graph_task_update_) {
+                    graph_task_update_->pending_acl_cleanups = cleanup_scope.Release();
+                }
+            } else {
+                runner_();
+                ret = aclmdlRICaptureTaskGrpEnd(stream, &handle);
+            }
             if (ret != ACL_SUCCESS) {
                 throw std::runtime_error("InfiniOps adapter: aclmdlRICaptureTaskGrpEnd failed");
             }
@@ -162,27 +183,32 @@ public:
 private:
     std::function<void()> runner_;
     std::shared_ptr<GraphTaskUpdate> graph_task_update_;
+    bool defer_acl_cleanup_;
 };
 
 void record_or_run(std::function<void()> runner,
-                   std::shared_ptr<GraphTaskUpdate> graph_task_update = nullptr) {
+                   std::shared_ptr<GraphTaskUpdate> graph_task_update = nullptr,
+                   bool defer_acl_cleanup = false) {
     if (infinicore::context::isGraphRecording()) {
         infinicore::context::addGraphOperator(
-            std::make_shared<InfiniOpsGraphOperator>(std::move(runner), graph_task_update));
+            std::make_shared<InfiniOpsGraphOperator>(
+                std::move(runner), graph_task_update, defer_acl_cleanup));
         return;
     }
 
     runner();
 }
 
-void record_or_run_updatable(std::function<void()> runner) {
+void record_or_run_updatable(std::function<void()> runner,
+                             bool defer_acl_cleanup = false) {
     std::shared_ptr<GraphTaskUpdate> update;
     if (infinicore::context::isGraphRecording() && active_graph_task_capture != nullptr) {
         update = std::make_shared<GraphTaskUpdate>();
         update->runner = runner;
+        update->defer_acl_cleanup = defer_acl_cleanup;
         active_graph_task_capture->push_back(update);
     }
-    record_or_run(std::move(runner), std::move(update));
+    record_or_run(std::move(runner), std::move(update), defer_acl_cleanup);
 }
 
 bool unquantized(const infinicore::nn::BaseLinear &linear) {
@@ -325,8 +351,18 @@ void update_graph_tasks(const GraphTaskUpdates &updates) {
         if (ret != ACL_SUCCESS) {
             throw std::runtime_error("InfiniOps adapter: aclmdlRICaptureTaskUpdateBegin failed");
         }
-        update->runner();
-        ret = aclmdlRICaptureTaskUpdateEnd(stream);
+        if (update->defer_acl_cleanup) {
+            infini::ops::ascend::DeferredAclCleanupScope cleanup_scope;
+            update->runner();
+            ret = aclmdlRICaptureTaskUpdateEnd(stream);
+            if (ret == ACL_SUCCESS) {
+                update->run_pending_acl_cleanups();
+                update->pending_acl_cleanups = cleanup_scope.Release();
+            }
+        } else {
+            update->runner();
+            ret = aclmdlRICaptureTaskUpdateEnd(stream);
+        }
         if (ret != ACL_SUCCESS) {
             throw std::runtime_error("InfiniOps adapter: aclmdlRICaptureTaskUpdateEnd failed");
         }
@@ -578,7 +614,8 @@ void mha_fwd_kvcache(const infinicore::Tensor &out,
                      const infinicore::Tensor &vcache,
                      const infinicore::Tensor &seqlens_k,
                      const infinicore::Tensor &block_table,
-                     float softmax_scale) {
+                     float softmax_scale,
+                     std::optional<infinicore::Tensor> seqlens_k_host) {
 #ifdef INFINILM_ENABLE_INFINIOPS
     auto out_g = infinicore::graph::GraphTensor(out);
     auto q_g = infinicore::graph::GraphTensor(q);
@@ -586,8 +623,8 @@ void mha_fwd_kvcache(const infinicore::Tensor &out,
     auto vcache_g = infinicore::graph::GraphTensor(vcache);
     auto seqlens_k_g = infinicore::graph::GraphTensor(seqlens_k);
     auto block_table_g = infinicore::graph::GraphTensor(block_table);
-    record_or_run_updatable([out_g, q_g, kcache_g, vcache_g, seqlens_k_g, block_table_g, softmax_scale]() {
-        std::optional<infini::ops::Tensor> seqlens_k_opt = as_tensor(seqlens_k_g);
+    record_or_run_updatable([out_g, q_g, kcache_g, vcache_g, seqlens_k_g, block_table_g, softmax_scale, seqlens_k_host]() {
+        std::optional<infini::ops::Tensor> seqlens_k_opt = seqlens_k_host.has_value() ? as_tensor(seqlens_k_host.value()) : as_tensor(seqlens_k_g);
         std::optional<infini::ops::Tensor> block_table_opt = as_tensor(block_table_g);
         std::optional<infini::ops::Tensor> no_tensor;
         infini::ops::MhaFwdKvcache::Call(
@@ -595,7 +632,7 @@ void mha_fwd_kvcache(const infinicore::Tensor &out,
             no_tensor, no_tensor, seqlens_k_opt, no_tensor, no_tensor,
             no_tensor, no_tensor, block_table_opt, no_tensor, as_tensor(out_g),
             softmax_scale, true, -1, 0, 0.0f, false, 0);
-    });
+    }, true);
 #else
     (void)out;
     (void)q;
@@ -604,6 +641,7 @@ void mha_fwd_kvcache(const infinicore::Tensor &out,
     (void)seqlens_k;
     (void)block_table;
     (void)softmax_scale;
+    (void)seqlens_k_host;
     require_enabled();
 #endif
 }
